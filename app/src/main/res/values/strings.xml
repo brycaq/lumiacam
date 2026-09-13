@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">1030 Cam</string>
+    <string name="permission_rationale">Camera and microphone access are needed to shoot photos and video.</string>
+</resources>
