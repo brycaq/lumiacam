@@ -247,22 +247,23 @@ class CameraController(private val context: Context) {
         val capture = videoCapture ?: error("Camera not bound yet")
         val name = "1030CAM_${timestamp()}.mp4"
 
-        val outputOptions = if (Build.VERSION.SDK_INT >= 29) {
+        val pendingRecording = if (Build.VERSION.SDK_INT >= 29) {
             val contentValues = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, name)
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
             }
-            MediaStoreOutputOptions.Builder(
+            val outputOptions = MediaStoreOutputOptions.Builder(
                 context.contentResolver,
                 MediaStore.Video.Media.EXTERNAL_CONTENT_URI
             ).setContentValues(contentValues).build()
+            capture.output.prepareRecording(context, outputOptions)
         } else {
             val file = File(context.getExternalFilesDir(null), name)
-            FileOutputOptions.Builder(file).build()
+            val outputOptions = FileOutputOptions.Builder(file).build()
+            capture.output.prepareRecording(context, outputOptions)
         }
 
-        activeRecording = capture.output
-            .prepareRecording(context, outputOptions)
+        activeRecording = pendingRecording
             .apply {
                 if (ContextCompat.checkSelfPermission(
                         context, android.Manifest.permission.RECORD_AUDIO
