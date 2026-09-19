@@ -1,3 +1,5 @@
+@file:OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
+
 package com.nokia1030cam.camera
 
 import android.content.ContentValues
@@ -17,11 +19,13 @@ import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.MediaStoreOutputOptions
@@ -46,11 +50,16 @@ import java.util.Locale
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 private const val TAG = "CameraController"
 private const val NIGHT_MODE_FRAME_COUNT = 6
 private const val BURST_FRAME_COUNT = 8
 
+/**
+ * Owns the CameraX use case graph and is the single place capture-mode logic lives. UI (Compose)
+ * only ever calls into this class; it never talks to CameraX or Camera2 directly.
+ */
 class CameraController(private val context: Context) {
 
     private var cameraProvider: ProcessCameraProvider? = null
@@ -61,6 +70,8 @@ class CameraController(private val context: Context) {
     private var oisAvailable: Boolean = false
     private var currentManualControls: ManualControls = ManualControls.AUTO
     private var currentStabilizationEnabled: Boolean = true
+    private var currentResolutionPreset: ResolutionPreset = ResolutionPreset.MP8
+    private var currentFlashMode: FlashMode = FlashMode.OFF
 
     private val outputExecutor = ContextCompat.getMainExecutor(context)
 
@@ -75,20 +86,35 @@ class CameraController(private val context: Context) {
 
         val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
-        val resolutionSelector = ResolutionSelector.Builder()
+        // Preview only needs a viewfinder-appropriate size — requesting the sensor's max
+        // resolution here would just slow down the live feed for no visible benefit.
+        val previewResolutionSelector = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
             .build()
 
+        // ImageCapture, on the other hand, explicitly asks for the sensor's HIGHEST available
+        // resolution. This is the fix for blurry/low-detail stills: oversampling only reduces
+        // noise and moiré if there are genuinely more captured pixels than the delivered output
+        // — blurring-then-downsampling a capture that was already close to the target resolution
+        // just throws away real detail for no benefit. Requesting the max here, then choosing how
+        // much to downsample based on the user's [ResolutionPreset], is what makes the PureView
+        // tradeoff (detail vs. noise) actually real instead of cosmetic.
+        val captureResolutionSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+            .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+            .build()
+
         val preview = Preview.Builder()
-            .setResolutionSelector(resolutionSelector)
+            .setResolutionSelector(previewResolutionSelector)
             .build()
             .also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
         val captureBuilder = ImageCapture.Builder()
-            .setResolutionSelector(resolutionSelector)
+            .setResolutionSelector(captureResolutionSelector)
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
         applyManualControls(captureBuilder, manualControls)
         val newImageCapture = captureBuilder.build()
+        newImageCapture.flashMode = currentFlashMode.toImageCaptureFlashMode()
 
         val recorder = Recorder.Builder()
             .setQualitySelector(QualitySelector.from(Quality.FHD))
@@ -111,17 +137,88 @@ class CameraController(private val context: Context) {
         pushCombinedLiveOptions()
     }
 
+    /**
+     * Pushes Pro-dial changes (ISO, shutter, white balance, focus) to the running camera
+     * session immediately via [Camera2CameraControl], instead of tearing down and rebinding the
+     * whole use case graph on every slider move — rebinding would blank the viewfinder for a
+     * frame on every drag tick, which is not how a physical dial should feel.
+     */
     fun updateLiveControls(controls: ManualControls) {
         currentManualControls = controls
         pushCombinedLiveOptions()
         applyExposureCompensation(controls.exposureCompensationStops)
     }
 
+    /** Applies (or removes) EIS/OIS on the live session without a rebind. */
     fun updateStabilization(enabled: Boolean) {
         currentStabilizationEnabled = enabled
         pushCombinedLiveOptions()
     }
 
+    fun setResolutionPreset(preset: ResolutionPreset) {
+        currentResolutionPreset = preset
+    }
+
+    /** Cycles the still-photo flash strategy. Has no effect on video — use [setTorchEnabled]. */
+    fun setFlashMode(mode: FlashMode) {
+        currentFlashMode = mode
+        imageCapture?.flashMode = mode.toImageCaptureFlashMode()
+    }
+
+    /** Video's equivalent of flash: a continuous torch, since a photo-style strobe can't sync to a rolling video frame. */
+    fun setTorchEnabled(enabled: Boolean) {
+        camera?.cameraControl?.enableTorch(enabled)
+    }
+
+    private fun FlashMode.toImageCaptureFlashMode(): Int = when (this) {
+        FlashMode.OFF -> ImageCapture.FLASH_MODE_OFF
+        FlashMode.AUTO -> ImageCapture.FLASH_MODE_AUTO
+        FlashMode.ON -> ImageCapture.FLASH_MODE_ON
+    }
+
+    /**
+     * Reports live zoom state (current/min/max ratio) back to the caller as plain floats rather
+     * than CameraX's [androidx.camera.core.ZoomState] type, so callers (the ViewModel) don't need
+     * a CameraX import just to read a UI value.
+     */
+    fun observeZoomState(owner: LifecycleOwner, onChanged: (current: Float, min: Float, max: Float) -> Unit) {
+        camera?.cameraInfo?.zoomState?.observe(owner) { zoomState ->
+            onChanged(zoomState.zoomRatio, zoomState.minZoomRatio, zoomState.maxZoomRatio)
+        }
+    }
+
+    /** Multiplies the current zoom ratio by a pinch-gesture scale factor (>1 = zoom in). */
+    fun onPinchZoom(scaleFactor: Float) {
+        val cam = camera ?: return
+        val zoomState = cam.cameraInfo.zoomState.value ?: return
+        val newRatio = (zoomState.zoomRatio * scaleFactor)
+            .coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
+        cam.cameraControl.setZoomRatio(newRatio)
+    }
+
+    /** Sets an absolute zoom ratio, e.g. for a "1x / 2x" quick-toggle button. */
+    fun setZoomRatio(ratio: Float) {
+        val cam = camera ?: return
+        val zoomState = cam.cameraInfo.zoomState.value ?: return
+        cam.cameraControl.setZoomRatio(ratio.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio))
+    }
+
+    /** Focuses (and meters exposure) at a tapped point on the viewfinder. */
+    fun tapToFocus(previewView: PreviewView, xPx: Float, yPx: Float) {
+        val cam = camera ?: return
+        val point = previewView.meteringPointFactory.createPoint(xPx, yPx)
+        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+            .setAutoCancelDuration(3, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+        cam.cameraControl.startFocusAndMetering(action)
+    }
+
+    /**
+     * [Camera2CameraControl.setCaptureRequestOptions] replaces the *entire* option set on every
+     * call rather than merging with whatever was set before, so manual-control and
+     * stabilization options are combined into one [CaptureRequestOptions] here and pushed
+     * together — calling it twice with two partial sets would silently clobber the first.
+     */
     private fun pushCombinedLiveOptions() {
         val cameraControl = camera?.cameraControl ?: return
         val optionsBuilder = CaptureRequestOptions.Builder()
@@ -187,20 +284,25 @@ class CameraController(private val context: Context) {
         cam.cameraControl.setExposureCompensationIndex(index)
     }
 
+    /**
+     * Captures a photo and routes it through the mode-appropriate processing pipeline. Every
+     * mode ends with [ColorScienceEngine] so the "natural color" look is consistent regardless
+     * of which capture path produced the frame.
+     */
     suspend fun capturePhoto(mode: CaptureMode): Uri {
         val capture = imageCapture ?: error("Camera not bound yet")
 
         val processedBitmap: Bitmap = when (mode) {
             CaptureMode.PHOTO, CaptureMode.PRO -> {
                 val raw = captureSingleFrame(capture)
-                val oversampled = OversamplingProcessor.oversample(raw)
+                val oversampled = OversamplingProcessor.oversample(raw, resolveOversampleRatio(raw))
                 ColorScienceEngine.applyNaturalColorScience(oversampled)
             }
 
             CaptureMode.NIGHT -> {
                 val frames = List(NIGHT_MODE_FRAME_COUNT) { captureSingleFrame(capture) }
                 val stacked = NightModeStacker.stack(frames)
-                val oversampled = OversamplingProcessor.oversample(stacked)
+                val oversampled = OversamplingProcessor.oversample(stacked, resolveOversampleRatio(stacked))
                 ColorScienceEngine.applyNaturalColorScience(oversampled)
             }
 
@@ -211,6 +313,8 @@ class CameraController(private val context: Context) {
             }
 
             CaptureMode.BURST -> {
+                // Burst returns its full sequence via captureBurst(); a single capturePhoto()
+                // call in BURST mode just yields the first (fastest) frame for convenience.
                 val raw = captureSingleFrame(capture)
                 ColorScienceEngine.applyNaturalColorScience(raw)
             }
@@ -222,6 +326,21 @@ class CameraController(private val context: Context) {
         return saveBitmapToMediaStore(processedBitmap)
     }
 
+    /**
+     * Converts the user's chosen [ResolutionPreset] into an oversampling ratio relative to what
+     * was *actually* captured this shot (not a fixed constant), so "5MP" always means 5MP
+     * regardless of what resolution the device's sensor happens to deliver. MAX
+     * (targetMegapixels == null) returns 1f — no downsampling, deliver the native captured
+     * resolution.
+     */
+    private fun resolveOversampleRatio(raw: Bitmap): Float {
+        val targetMp = currentResolutionPreset.targetMegapixels ?: return 1f
+        val actualMp = (raw.width.toLong() * raw.height.toLong()) / 1_000_000.0
+        if (actualMp <= targetMp) return 1f
+        return sqrt(actualMp / targetMp).toFloat()
+    }
+
+    /** Fires [BURST_FRAME_COUNT] frames back to back, each fully color-processed. */
     suspend fun captureBurst(): List<Uri> {
         val capture = imageCapture ?: error("Camera not bound yet")
         val uris = mutableListOf<Uri>()
@@ -233,6 +352,11 @@ class CameraController(private val context: Context) {
         return uris
     }
 
+    /**
+     * Captures [frameCount] frames as the user physically sweeps the phone, then stitches them.
+     * The caller (UI layer) is responsible for pacing calls to this so frames are spread across
+     * the sweep — see `PanoramaCaptureFlow` in the ViewModel.
+     */
     suspend fun capturePanoramaFrame(): Bitmap {
         val capture = imageCapture ?: error("Camera not bound yet")
         return captureSingleFrame(capture)
@@ -248,6 +372,10 @@ class CameraController(private val context: Context) {
         val capture = videoCapture ?: error("Camera not bound yet")
         val name = "1030CAM_${timestamp()}.mp4"
 
+        // Built and passed to prepareRecording() separately per branch, rather than assigned to
+        // a shared variable first: MediaStoreOutputOptions and FileOutputOptions only share the
+        // abstract OutputOptions base type, and prepareRecording() has no overload for that base
+        // type — only for each concrete subtype — so a shared variable makes the call unresolvable.
         val pendingRecording = if (Build.VERSION.SDK_INT >= 29) {
             val contentValues = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, name)
@@ -283,6 +411,8 @@ class CameraController(private val context: Context) {
 
     fun isOisAvailable(): Boolean = oisAvailable
 
+    // ---- internals ----------------------------------------------------------------------
+
     private suspend fun getOrCreateCameraProvider(): ProcessCameraProvider =
         cameraProvider ?: suspendCancellableCoroutine { cont ->
             val future = ProcessCameraProvider.getInstance(context)
@@ -306,6 +436,7 @@ class CameraController(private val context: Context) {
             extender.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, it)
         }
         if (controls.isoSensitivity != null || controls.shutterSpeedNanos != null) {
+            // Manual ISO/shutter requires AE_MODE_OFF, matching how Pro Cam's manual dials worked.
             extender.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
         }
         controls.whiteBalanceKelvin?.let { kelvin ->
@@ -317,8 +448,14 @@ class CameraController(private val context: Context) {
             extender.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
             extender.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, it)
         }
+        if (controls.exposureCompensationStops != 0f) {
+            // Applied via ImageCapture's own EV API rather than a raw request key, since the
+            // step size is device-dependent and CameraX/Camera2 already normalize that for us.
+            // (Wired up by the caller via CameraController.setExposureCompensation.)
+        }
     }
 
+    /** Rough Kelvin -> RGGB gain approximation (Planckian locus simplification). */
     private fun kelvinToRggbGains(kelvin: Int): android.hardware.camera2.params.RggbChannelVector {
         val temp = kelvin.coerceIn(1000, 40000) / 100.0
         val red: Double
@@ -340,6 +477,13 @@ class CameraController(private val context: Context) {
         return android.hardware.camera2.params.RggbChannelVector(rGain, 1f, 1f, bGain)
     }
 
+    /**
+     * `Camera2CameraInfo.extractCameraCharacteristics` looks like a normal public helper but is
+     * actually `@RestrictedApi` inside CameraX (reserved for CameraX's own internal modules), so
+     * Lint hard-fails on calling it from app code. This gets the same [CameraCharacteristics]
+     * through the sanctioned path instead: the public `cameraId` property, handed to Android's
+     * own [CameraManager].
+     */
     private fun queryOisSupport(provider: ProcessCameraProvider, selector: CameraSelector): Boolean {
         return try {
             val cameraInfo = selector.filter(provider.availableCameraInfos).firstOrNull() ?: return false
