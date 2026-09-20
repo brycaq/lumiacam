@@ -8,6 +8,7 @@ import androidx.camera.view.PreviewView
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -23,13 +24,25 @@ data class CameraUiState(
     val panoramaFrameCount: Int = 0,
     val oisAvailable: Boolean = false,
     val lastCaptureUri: Uri? = null,
-    val errorMessage: String? = null
+    val lastCaptureEventId: Long = 0L,
+    val errorMessage: String? = null,
+    val zoomRatio: Float = 1f,
+    val minZoomRatio: Float = 1f,
+    val maxZoomRatio: Float = 1f,
+    val flashMode: FlashMode = FlashMode.OFF,
+    val torchEnabled: Boolean = false,
+    val resolutionPreset: ResolutionPreset = ResolutionPreset.MP8,
+    // Fraction (0f..1f) of the viewfinder where the user last tapped to focus; null when no
+    // focus reticle should be shown. Cleared automatically a moment after it's set.
+    val focusPointPercent: Pair<Float, Float>? = null
 )
 
 class CameraViewModel(application: Application) : AndroidViewModel(application) {
 
     private val controller = CameraController(application)
     private val panoramaFrames = mutableListOf<Bitmap>()
+    private var focusIndicatorJob: kotlinx.coroutines.Job? = null
+    private var captureEventCounter = 0L
 
     private val _uiState = MutableStateFlow(CameraUiState())
     val uiState: StateFlow<CameraUiState> = _uiState.asStateFlow()
@@ -45,6 +58,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 )
             }.onSuccess {
                 _uiState.value = _uiState.value.copy(oisAvailable = controller.isOisAvailable())
+                controller.observeZoomState(lifecycleOwner) { current, min, max ->
+                    _uiState.value = _uiState.value.copy(
+                        zoomRatio = current,
+                        minZoomRatio = min,
+                        maxZoomRatio = max
+                    )
+                }
             }.onFailure { e ->
                 _uiState.value = _uiState.value.copy(errorMessage = e.message)
             }
@@ -52,6 +72,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun selectMode(mode: CaptureMode) {
+        // Leaving video mode should drop any torch we left on.
+        if (_uiState.value.mode == CaptureMode.VIDEO && mode != CaptureMode.VIDEO && _uiState.value.torchEnabled) {
+            controller.setTorchEnabled(false)
+            _uiState.value = _uiState.value.copy(torchEnabled = false)
+        }
         _uiState.value = _uiState.value.copy(mode = mode)
     }
 
@@ -63,6 +88,51 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleStabilization(enabled: Boolean) {
         _uiState.value = _uiState.value.copy(stabilizationEnabled = enabled)
         controller.updateStabilization(enabled)
+    }
+
+    /** Multiplies zoom by a pinch-gesture scale delta; the authoritative new value arrives via observeZoomState. */
+    fun onPinchZoom(scaleFactor: Float) {
+        controller.onPinchZoom(scaleFactor)
+    }
+
+    fun setZoomRatio(ratio: Float) {
+        controller.setZoomRatio(ratio)
+    }
+
+    /** Focuses at a tapped point and shows a brief reticle there. */
+    fun onTapToFocus(previewView: PreviewView, xPx: Float, yPx: Float, xPercent: Float, yPercent: Float) {
+        controller.tapToFocus(previewView, xPx, yPx)
+        _uiState.value = _uiState.value.copy(focusPointPercent = xPercent to yPercent)
+        focusIndicatorJob?.cancel()
+        focusIndicatorJob = viewModelScope.launch {
+            delay(900)
+            _uiState.value = _uiState.value.copy(focusPointPercent = null)
+        }
+    }
+
+    /** In VIDEO mode this toggles the torch; in photo modes it cycles OFF → AUTO → ON. */
+    fun onFlashButtonPressed() {
+        if (_uiState.value.mode == CaptureMode.VIDEO) {
+            val newTorchState = !_uiState.value.torchEnabled
+            controller.setTorchEnabled(newTorchState)
+            _uiState.value = _uiState.value.copy(torchEnabled = newTorchState)
+            return
+        }
+        val next = when (_uiState.value.flashMode) {
+            FlashMode.OFF -> FlashMode.AUTO
+            FlashMode.AUTO -> FlashMode.ON
+            FlashMode.ON -> FlashMode.OFF
+        }
+        controller.setFlashMode(next)
+        _uiState.value = _uiState.value.copy(flashMode = next)
+    }
+
+    /** Cycles through the available output-resolution presets. */
+    fun cycleResolutionPreset() {
+        val presets = ResolutionPreset.entries
+        val next = presets[(presets.indexOf(_uiState.value.resolutionPreset) + 1) % presets.size]
+        controller.setResolutionPreset(next)
+        _uiState.value = _uiState.value.copy(resolutionPreset = next)
     }
 
     fun onShutterPressed(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
@@ -81,7 +151,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             runCatching { controller.capturePhoto(mode) }
                 .onSuccess { uri ->
-                    _uiState.value = _uiState.value.copy(isCapturing = false, lastCaptureUri = uri)
+                    _uiState.value = _uiState.value.copy(
+                        isCapturing = false,
+                        lastCaptureUri = uri,
+                        lastCaptureEventId = ++captureEventCounter
+                    )
                 }
                 .onFailure { e ->
                     _uiState.value = _uiState.value.copy(isCapturing = false, errorMessage = e.message)
@@ -95,7 +169,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             runCatching { controller.captureBurst() }
                 .onSuccess { uris ->
-                    _uiState.value = _uiState.value.copy(isCapturing = false, lastCaptureUri = uris.lastOrNull())
+                    _uiState.value = _uiState.value.copy(
+                        isCapturing = false,
+                        lastCaptureUri = uris.lastOrNull(),
+                        lastCaptureEventId = ++captureEventCounter
+                    )
                 }
                 .onFailure { e ->
                     _uiState.value = _uiState.value.copy(isCapturing = false, errorMessage = e.message)
@@ -103,6 +181,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    /** Each shutter press while sweeping grabs one frame; a long-press-free simple flow. */
     private fun handlePanoramaShutter(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
         val state = _uiState.value
         if (!state.isPanoramaSweeping) {
@@ -138,7 +217,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         isCapturing = false,
                         isPanoramaSweeping = false,
                         panoramaFrameCount = 0,
-                        lastCaptureUri = uri
+                        lastCaptureUri = uri,
+                        lastCaptureEventId = ++captureEventCounter
                     )
                 }
                 .onFailure { e ->
@@ -166,6 +246,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     _uiState.value = _uiState.value.copy(
                         isRecording = false,
                         lastCaptureUri = if (!event.hasError()) event.outputResults.outputUri else null,
+                        lastCaptureEventId = if (!event.hasError()) ++captureEventCounter else _uiState.value.lastCaptureEventId,
                         errorMessage = if (event.hasError()) "Recording error: ${event.error}" else null
                     )
                 }
